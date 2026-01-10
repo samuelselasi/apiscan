@@ -1,3 +1,5 @@
+# src/apiscan/cli.py
+
 import argparse
 import asyncio
 from pathlib import Path
@@ -10,6 +12,7 @@ from apiscan.http import HttpClient
 from apiscan.scanner import Scanner
 from apiscan.report import generate_html_report
 from apiscan.discovery import discover_paths
+from apiscan.auth import AuthConfig, AuthType, RequestContext
 
 console = Console()
 
@@ -24,7 +27,31 @@ def render_summary(summary):
     )
 
 
+def parse_headers(items: list[str]) -> dict[str, str]:
+    """
+    Parse repeated --header 'Key: Value' entries.
+    """
+    headers: dict[str, str] = {}
+    for item in items:
+        if ":" not in item:
+            raise SystemExit(f'Invalid --header "{item}". Use "Key: Value".')
+        k, v = item.split(":", 1)
+        k = k.strip()
+        v = v.strip()
+        if not k:
+            raise SystemExit(f'Invalid --header "{item}". Header key cannot be empty.')
+        headers[k] = v
+    return headers
+
+
 def _resolve_output_path(output_dir: str | None, filename: str | None, default_name: str) -> str | None:
+    """
+    If output_dir is provided:
+      - if filename is None -> use output_dir/default_name
+      - if filename is relative -> output_dir/filename
+      - if filename is absolute -> keep as is
+    If output_dir is not provided, return filename as-is.
+    """
     if not output_dir:
         return filename
 
@@ -42,7 +69,7 @@ def _resolve_output_path(output_dir: str | None, filename: str | None, default_n
 
 
 def _merge_paths(user_paths: list[str], discovered_paths: list[str], max_paths: int) -> list[str]:
-    cleaned = []
+    cleaned: list[str] = []
 
     def add(p: str):
         if not p:
@@ -57,8 +84,8 @@ def _merge_paths(user_paths: list[str], discovered_paths: list[str], max_paths: 
         add(p)
 
     # Dedupe while preserving order
-    seen = set()
-    merged = []
+    seen: set[str] = set()
+    merged: list[str] = []
     for p in cleaned:
         if p not in seen:
             seen.add(p)
@@ -77,12 +104,13 @@ async def run_scan(
     output_dir: str | None,
     concurrency: int,
     timeout: int,
+    context: RequestContext,
 ):
     json_path = _resolve_output_path(output_dir, json_output, "apiscan_report.json")
     html_path = _resolve_output_path(output_dir, html_output, "apiscan_report.html")
 
-    discovered = []
-    spec_url = None
+    discovered: list[str] = []
+    spec_url: str | None = None
 
     if discover:
         console.print("[bold]Discovering endpoints via OpenAPI/Swagger...[/bold]")
@@ -100,14 +128,9 @@ async def run_scan(
     console.print(f"[bold]Scanning {url}[/bold]")
     console.print(f"Paths to scan ({len(paths)}): {', '.join(paths[:10])}" + (" ..." if len(paths) > 10 else "") + "\n")
 
-    async with HttpClient(url, timeout=timeout) as client:
+    async with HttpClient(url, timeout=timeout, context=context) as client:
         scanner = Scanner(client, concurrency=concurrency)
         result = await scanner.scan(paths=paths)
-
-    # attach discovery info into JSON/HTML via evidence in a global finding (simple and visible)
-    if discover and spec_url:
-        # Don’t import Finding/Severity here to keep CLI simple; scanner output is already good.
-        pass
 
     console.print(Panel.fit(render_summary(result.summary), title="Severity Summary"))
 
@@ -172,6 +195,24 @@ def main():
         help="Max number of paths to scan after merging user and discovered paths (default: 30).",
     )
 
+    # Auth + headers (v0.2 foundation)
+    parser.add_argument(
+        "--header",
+        action="append",
+        default=[],
+        help='Custom header in "Key: Value" format. Can be used multiple times.',
+    )
+    parser.add_argument(
+        "--auth-type",
+        choices=["none", "bearer", "api-key", "basic"],
+        default="none",
+        help="Authentication type to use for requests.",
+    )
+    parser.add_argument("--auth-token", help="Token for bearer or api-key auth.")
+    parser.add_argument("--api-key-name", default="X-API-Key", help="Header name for api-key auth (default: X-API-Key).")
+    parser.add_argument("--auth-user", help="Username for basic auth.")
+    parser.add_argument("--auth-pass", help="Password for basic auth.")
+
     parser.add_argument("--json", dest="json_output", help="Write scan report to JSON file (default inside output-dir)")
     parser.add_argument("--report-html", dest="html_output", help="Write scan report to HTML file (default inside output-dir)")
     parser.add_argument("--output-dir", dest="output_dir", help="Directory to store outputs (creates default JSON/HTML names)")
@@ -180,6 +221,18 @@ def main():
     parser.add_argument("--timeout", type=int, default=10, help="Request timeout in seconds")
 
     args = parser.parse_args()
+
+    # Build request context (custom headers + auth)
+    custom_headers = parse_headers(args.header)
+
+    auth = AuthConfig(
+        auth_type=AuthType(args.auth_type),
+        token=args.auth_token,
+        api_key_name=args.api_key_name,
+        username=args.auth_user,
+        password=args.auth_pass,
+    )
+    context = RequestContext(headers=custom_headers, auth=auth)
 
     asyncio.run(
         run_scan(
@@ -192,6 +245,7 @@ def main():
             output_dir=args.output_dir,
             concurrency=args.concurrency,
             timeout=args.timeout,
+            context=context,
         )
     )
 
