@@ -1,9 +1,12 @@
+# tests/test_cli_outputs.py
+
 from pathlib import Path
 import json
 import pytest
 
 import apiscan.cli as cli
 from apiscan.models import ScanResult, PathResult, Finding, Severity, SeveritySummary
+from apiscan.auth import RequestContext, AuthConfig, AuthType
 
 
 def _fake_result():
@@ -29,8 +32,15 @@ def _fake_result():
     )
 
 
+DEFAULT_CTX = RequestContext(
+    headers={},
+    auth=AuthConfig(auth_type=AuthType.none),
+)
+
+
 @pytest.mark.asyncio
 async def test_cli_output_dir_creates_default_reports(tmp_path: Path, monkeypatch):
+    # Patch HttpClient context manager to avoid network usage
     class DummyClient:
         base_url = "https://example.com"
 
@@ -40,6 +50,13 @@ async def test_cli_output_dir_creates_default_reports(tmp_path: Path, monkeypatc
         async def __aexit__(self, exc_type, exc, tb):
             return False
 
+        async def get(self, path="/"):
+            raise RuntimeError("Should not be called in this test")
+
+        async def options(self, path="/"):
+            raise RuntimeError("Should not be called in this test")
+
+    # Patch Scanner.scan to return a known result
     class DummyScanner:
         def __init__(self, client, concurrency=10):
             pass
@@ -47,9 +64,10 @@ async def test_cli_output_dir_creates_default_reports(tmp_path: Path, monkeypatc
         async def scan(self, paths=None):
             return _fake_result()
 
-    monkeypatch.setattr(cli, "HttpClient", lambda url, timeout=10: DummyClient())
+    monkeypatch.setattr(cli, "HttpClient", lambda url, timeout=10, context=None: DummyClient())
     monkeypatch.setattr(cli, "Scanner", DummyScanner)
 
+    # Patch HTML report generator to write minimal content (avoid template dependency)
     def fake_generate_html_report(result, output_html):
         Path(output_html).write_text("<html>APIScan Report</html>", encoding="utf-8")
 
@@ -67,6 +85,7 @@ async def test_cli_output_dir_creates_default_reports(tmp_path: Path, monkeypatc
         output_dir=str(outdir),
         concurrency=5,
         timeout=5,
+        context=DEFAULT_CTX,
     )
 
     json_path = outdir / "apiscan_report.json"
@@ -99,7 +118,7 @@ async def test_cli_output_dir_respects_custom_filenames(tmp_path: Path, monkeypa
         async def scan(self, paths=None):
             return _fake_result()
 
-    monkeypatch.setattr(cli, "HttpClient", lambda url, timeout=10: DummyClient())
+    monkeypatch.setattr(cli, "HttpClient", lambda url, timeout=10, context=None: DummyClient())
     monkeypatch.setattr(cli, "Scanner", DummyScanner)
 
     def fake_generate_html_report(result, output_html):
@@ -119,6 +138,7 @@ async def test_cli_output_dir_respects_custom_filenames(tmp_path: Path, monkeypa
         output_dir=str(outdir),
         concurrency=5,
         timeout=5,
+        context=DEFAULT_CTX,
     )
 
     assert (outdir / "custom.json").exists()
